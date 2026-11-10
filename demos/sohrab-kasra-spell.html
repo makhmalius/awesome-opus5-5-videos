@@ -1,0 +1,702 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sohrab's Spell</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #0b0b1e; }
+  canvas {
+    display: block;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+  }
+</style>
+</head>
+<body>
+<canvas id="screen"></canvas>
+<script>
+'use strict';
+/* ------------------------------------------------------------------
+   Sohrab's Spell — 128x96 pixel-art animation, vanilla JS + Canvas 2D.
+   Everything renders into an indexed 8-bit framebuffer, converted
+   through a fixed palette, then blitted at an integer scale.
+   ------------------------------------------------------------------ */
+
+const W = 128, H = 96;
+const STEP = 1000 / 60;          // fixed 60 Hz simulation step
+const LOOP = 600;                // loop length in ticks (10 s)
+const FLOOR = 80;                // feet row; stone line is FLOOR + 1
+const WX = 22;                   // wizard centre x
+const KX = 98;                   // Kasra centre x
+const T = 255;                   // transparent index in layers
+
+/* ---------------- Palette (26 colours, every pixel comes from here) -- */
+const HEX = [
+  '#0b0b1e', // 0  sky deepest
+  '#141432', // 1  sky dark / far hills
+  '#1f1f4f', // 2  sky low
+  '#2e2a6b', // 3  purple
+  '#5b4aa8', // 4  purple light
+  '#ece6c6', // 5  moon
+  '#b4ac8e', // 6  moon craters
+  '#34303f', // 7  stone dark
+  '#5c566a', // 8  stone light
+  '#3a1422', // 9  robe outline
+  '#7a2a3a', // 10 robe dark
+  '#b4483f', // 11 robe light
+  '#e8a848', // 12 gold trim
+  '#f2c9a0', // 13 skin
+  '#c08466', // 14 skin shade
+  '#0e0e12', // 15 beard near-black
+  '#3a3a46', // 16 beard charcoal highlight
+  '#6e4628', // 17 staff wood
+  '#ffffff', // 18 crisp white
+  '#c6cee2', // 19 white shade
+  '#3fe6ff', // 20 magic cyan
+  '#ff4fd8', // 21 magic magenta
+  '#fff27a', // 22 magic yellow
+  '#1c4a3a', // 23 fabric green dark
+  '#2f7458', // 24 fabric green light
+  '#2a1a14'  // 25 hair / leather
+];
+const SKY0 = 0, SKY1 = 1, SKY2 = 2, PUR = 3, PURL = 4, MOON = 5, MOOND = 6,
+      STONED = 7, STONEL = 8, ROBEO = 9, ROBED = 10, ROBEL = 11, GOLD = 12,
+      SKIN = 13, SKIND = 14, BEARD = 15, BEARDH = 16, WOOD = 17, WHITE = 18,
+      WHITED = 19, CYAN = 20, MAG = 21, YEL = 22, GRN = 23, GRNL = 24, HAIR = 25;
+
+const pal32 = new Uint32Array(HEX.length);
+for (let i = 0; i < HEX.length; i++) {
+  const n = parseInt(HEX[i].slice(1), 16);
+  pal32[i] = ((255 << 24) | ((n & 255) << 16) | (((n >> 8) & 255) << 8) | ((n >> 16) & 255)) >>> 0;
+}
+
+/* ---------------- Canvases & buffers (allocated once) ---------------- */
+const disp = document.getElementById('screen');
+const dctx = disp.getContext('2d', { alpha: false });
+const off = document.createElement('canvas');
+off.width = W; off.height = H;
+const octx = off.getContext('2d');
+const img = octx.createImageData(W, H);
+const out32 = new Uint32Array(img.data.buffer);
+
+const fb = new Uint8Array(W * H);   // final indexed frame
+const bg = new Uint8Array(W * H);   // baked static background
+const LW = new Uint8Array(W * H);   // wizard body layer
+const LK = new Uint8Array(W * H);   // Kasra layer
+
+let scale = 1, offX = 0, offY = 0;
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  const cw = Math.floor(window.innerWidth * dpr);
+  const ch = Math.floor(window.innerHeight * dpr);
+  disp.width = cw; disp.height = ch;
+  disp.style.width = window.innerWidth + 'px';
+  disp.style.height = window.innerHeight + 'px';
+  scale = Math.max(1, Math.floor(Math.min(cw / W, ch / H)));
+  offX = Math.floor((cw - W * scale) / 2);
+  offY = Math.floor((ch - H * scale) / 2);
+  dctx.imageSmoothingEnabled = false;
+}
+window.addEventListener('resize', resize);
+resize();
+
+/* ---------------- Pixel primitives (integer only) -------------------- */
+function px(L, x, y, c) {
+  x = x | 0; y = y | 0;
+  if (x < 0 || y < 0 || x >= W || y >= H) return;
+  L[y * W + x] = c;
+}
+function rect(L, x, y, w, h, c) {
+  for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) px(L, x + i, y + j, c);
+}
+function line(L, x0, y0, x1, y1, c) {
+  x0 |= 0; y0 |= 0; x1 |= 0; y1 |= 0;
+  const dx = Math.abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+  const dy = -Math.abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+  let err = dx + dy;
+  for (;;) {
+    px(L, x0, y0, c);
+    if (x0 === x1 && y0 === y1) break;
+    const e2 = 2 * err;
+    if (e2 >= dy) { err += dy; x0 += sx; }
+    if (e2 <= dx) { err += dx; y0 += sy; }
+  }
+}
+function hash(x, y, f) {
+  let h = (Math.imul(x, 374761393) + Math.imul(y, 668265263) + Math.imul(f, 1103515245)) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return (h ^ (h >>> 16)) >>> 0;
+}
+let seed = 0x9e3779b9;
+function rnd() {
+  seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5;
+  return (seed >>> 0) / 4294967296;
+}
+function clamp01(v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
+function ease(t) { return t < 0.5 ? 2 * t * t : 1 - 2 * (1 - t) * (1 - t); }
+
+/* ---------------- Pixel font (3x5) ---------------------------------- */
+const GLYPHS = {
+  S: [3, 4, 2, 1, 6], o: [0, 2, 5, 5, 2], h: [4, 4, 6, 5, 5], r: [0, 3, 4, 4, 4],
+  a: [0, 3, 5, 5, 3], b: [4, 4, 6, 5, 6], K: [5, 5, 6, 5, 5], s: [0, 3, 2, 1, 6]
+};
+function drawText(L, str, cx, y, c, shadow) {
+  const w = str.length * 4 - 1;
+  const x0 = cx - (w >> 1);
+  for (let pass = 0; pass < 2; pass++) {
+    const d = pass === 0 ? 1 : 0, col = pass === 0 ? shadow : c;
+    for (let i = 0; i < str.length; i++) {
+      const g = GLYPHS[str[i]];
+      for (let r = 0; r < 5; r++) for (let b = 0; b < 3; b++)
+        if (g[r] & (4 >> b)) px(L, x0 + i * 4 + b + d, y + r + d, col);
+    }
+  }
+}
+
+/* ---------------- Bake the static background ------------------------ */
+(function bakeBackground() {
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    let c;
+    if (y <= FLOOR) {
+      if (y < 24) c = SKY0;
+      else if (y < 30) c = ((x + y) & 1) && y > 25 + (x & 1) * 2 ? SKY1 : SKY0;
+      else if (y < 50) c = SKY1;
+      else if (y < 56) c = ((x + y) & 1) && y > 51 + (x & 1) * 2 ? SKY2 : SKY1;
+      else c = SKY2;
+      // far rolling hills
+      const hill = 71 + Math.round(3 * Math.sin(x * 0.07) + 2 * Math.sin(x * 0.19 + 1.3));
+      if (y > hill) c = SKY1;
+      else if (y === hill && (x & 1)) c = SKY1;
+    } else if (y === FLOOR + 1) {
+      c = STONEL;
+    } else {
+      const ry = y - (FLOOR + 2), row = (ry / 5) | 0, ly = ry % 5;
+      const shift = (row & 1) ? 5 : 0;
+      const lx = (x + shift) % 10;
+      if (ly === 4 || lx === 0) c = SKY1;            // mortar
+      else if (ly === 0 && lx === 1) c = STONEL;     // stone highlight
+      else if (ly === 0 && lx < 8 && row === 0) c = STONEL;
+      else c = STONED;
+    }
+    bg[y * W + x] = c;
+  }
+  // moon with halo and craters
+  const mx = 110, my = 14;
+  for (let y = my - 9; y <= my + 9; y++) for (let x = mx - 9; x <= mx + 9; x++) {
+    const dx = x - mx, dy = y - my, d2 = dx * dx + dy * dy;
+    if (d2 <= 37) px(bg, x, y, (dx + dy > 5 && d2 > 18) ? MOOND : MOON);
+    else if (d2 <= 70 && ((x + y) & 1)) px(bg, x, y, PUR);
+  }
+  px(bg, mx - 2, my - 2, MOOND); px(bg, mx - 1, my - 2, MOOND); px(bg, mx + 1, my + 1, MOOND);
+  px(bg, mx - 3, my + 2, MOOND); px(bg, mx + 2, my - 3, MOOND);
+  // name labels (static, crisp)
+  drawText(bg, 'Sohrab', WX + 1, 32, WHITE, SKY0);
+  drawText(bg, 'Kasra', KX, 45, WHITE, SKY0);
+})();
+
+/* ---------------- Stars -------------------------------------------- */
+const NSTARS = 30;
+const starX = new Uint8Array(NSTARS), starY = new Uint8Array(NSTARS), starP = new Uint8Array(NSTARS);
+for (let i = 0, n = 0; n < NSTARS && i < 1000; i++) {
+  const x = (rnd() * W) | 0, y = (rnd() * 58) | 0;
+  const dx = x - 110, dy = y - 14;
+  if (dx * dx + dy * dy < 120) continue;
+  if ((y > 29 && y < 40 && x > 6 && x < 38) || (y > 42 && y < 52 && x > 84 && x < 112)) continue; // keep labels clean
+  starX[n] = x; starY[n] = y; starP[n] = (rnd() * 64) | 0; n++;
+}
+
+/* ---------------- Particles (pooled, allocation-free) --------------- */
+const NP = 320;
+const pX = new Float32Array(NP), pY = new Float32Array(NP);
+const pVX = new Float32Array(NP), pVY = new Float32Array(NP);
+const pAng = new Float32Array(NP), pRad = new Float32Array(NP);
+const pLife = new Int16Array(NP), pMax = new Int16Array(NP);
+const pKind = new Uint8Array(NP), pMag = new Uint8Array(NP);
+const MAGICS = new Uint8Array([CYAN, MAG, YEL]);
+let pCursor = 0;
+// kinds: 1 orbit (spiral into gem), 2 ballistic (gravity), 3 float up, 4 drift
+function spawn(kind, x, y, vx, vy, life, mag) {
+  let i = pCursor, n = 0;
+  while (pLife[i] > 0 && n < NP) { i = (i + 1) % NP; n++; }
+  pCursor = (i + 1) % NP;
+  pKind[i] = kind; pX[i] = x; pY[i] = y; pVX[i] = vx; pVY[i] = vy;
+  pLife[i] = life; pMax[i] = life; pMag[i] = mag;
+  return i;
+}
+function particleColor(i) {
+  const p = pLife[i] / pMax[i];
+  if (p > 0.78) return WHITE;
+  if (p > 0.42) return pMag[i];
+  if (p > 0.2) return PURL;
+  return PUR;
+}
+
+/* ---------------- Animation state ---------------------------------- */
+const IDLE = 0, CHARGE = 1, CAST = 2, RECOVER = 3;
+const CHARGE_AT = 150, CAST_AT = 240, RECOVER_AT = 310, IDLE2_AT = 370, REVERT_AT = 540;
+// pose keyframes: staff angle, arm raise, arm forward, head tilt
+const P_IDLE = new Float32Array([0.16, 0, 0, 0]);
+const P_CHARGE = new Float32Array([-0.06, 1, 0, -1]);
+const P_CAST = new Float32Array([0.8, 0.45, 1, 1]);
+const P = new Float32Array(4);
+function lerpPose(A, B, e) { for (let i = 0; i < 4; i++) P[i] = A[i] + (B[i] - A[i]) * e; }
+
+let tick = 0, lt = 0;               // global tick, loop tick
+let state = IDLE, stateT = 0;
+let bob = 0, beardSway = 0, robeSway = 0, hatSway = 0, tilt = 0;
+let handX = 0, handY = 0, gemX = 0, gemY = 0, staffBX = 0, staffBY = 0;
+let hitT = -1;
+let projOn = false, projT = 0, projSX = 0, projSY = 0, projDX = 0, projDY = 0, projLen = 1, prX = 0, prY = 0;
+let shakeT = 0, shakeA = 0;
+const PROJ_TX = KX - 1, PROJ_TY = 73;   // aim: Kasra's skirt
+
+function stateOf(t) {
+  if (t < CHARGE_AT) return IDLE;
+  if (t < CAST_AT) return CHARGE;
+  if (t < RECOVER_AT) return CAST;
+  if (t < IDLE2_AT) return RECOVER;
+  return IDLE;
+}
+function stateStart(s, t) {
+  if (s === CHARGE) return CHARGE_AT;
+  if (s === CAST) return CAST_AT;
+  if (s === RECOVER) return RECOVER_AT;
+  return t < CHARGE_AT ? 0 : IDLE2_AT;
+}
+
+// Pose is evaluated smoothly but sampled on a 6-tick (10 fps) grid, then rounded to pixels.
+function computePose() {
+  const q = lt - (lt % 6);
+  const s = stateOf(q), st = q - stateStart(s, q);
+  const af = (q / 6) | 0;
+  if (s === CHARGE) lerpPose(P_IDLE, P_CHARGE, ease(clamp01(st / 36)));
+  else if (s === CAST) lerpPose(P_CHARGE, P_CAST, ease(clamp01(st / 8)));
+  else if (s === RECOVER) lerpPose(P_CAST, P_IDLE, ease(clamp01(st / 48)));
+  else lerpPose(P_IDLE, P_IDLE, 0);
+
+  if (s === IDLE) {
+    bob = ((q / 30) | 0) & 1;                       // 2-frame bob
+    beardSway = (((q + 12) / 30) | 0) & 1 ? 1 : 0;  // beard follows through
+    robeSway = Math.round(Math.sin(q * 0.035));
+    hatSway = (((q + 18) / 30) | 0) & 1 ? 1 : 0;
+  } else if (s === CHARGE) {
+    bob = 0;
+    beardSway = (af & 1) ? -1 : 0;                  // magic wind flutter
+    robeSway = (af & 1) ? -1 : -2;
+    hatSway = (af & 1) ? -1 : 0;
+  } else if (s === CAST) {
+    bob = 0; beardSway = -1; robeSway = st < 18 ? -2 : -1; hatSway = -1;
+  } else {
+    bob = st > 30 ? 1 : 0; beardSway = 0; robeSway = st < 24 ? -1 : 0; hatSway = 0;
+  }
+  if (robeSway < -2) robeSway = -2;
+  tilt = Math.round(P[3]);
+
+  handX = WX + 6 + Math.round(P[2] * 4);
+  handY = Math.round((68 + bob) + (61 - (68 + bob)) * P[1]);
+  const a = P[0], dx = Math.sin(a), dy = -Math.cos(a);
+  gemX = Math.round(handX + 0.5 + dx * 15);
+  gemY = Math.round(handY + 0.5 + dy * 15);
+  const lb = Math.min(17 - 9 * P[2], (FLOOR - handY) / Math.cos(a));
+  staffBX = Math.round(handX + 0.5 - dx * lb);
+  staffBY = Math.round(handY + 0.5 - dy * lb);
+}
+
+/* ---------------- Fixed-step update -------------------------------- */
+function update() {
+  tick++;
+  lt++;
+  if (lt >= LOOP) { lt = 0; hitT = -1; projOn = false; }
+  const s = stateOf(lt);
+  if (s !== state) state = s;
+  stateT = lt - stateStart(s, lt);
+  computePose();
+
+  // CHARGE: sparks spawn on a ring and spiral inward
+  if (state === CHARGE && stateT < 84 && (tick & 1) === 0) {
+    const i = spawn(1, gemX, gemY, 0, 0, 70, MAGICS[(rnd() * 3) | 0]);
+    pAng[i] = rnd() * Math.PI * 2;
+    pRad[i] = 6 + rnd() * 5;
+  }
+  // idle ambience: occasional mote from the gem
+  if (state === IDLE && lt % 22 === 0) spawn(3, gemX, gemY - 1, 0, -0.18, 34, CYAN);
+
+  // CAST: burst
+  if (lt === CAST_AT) {
+    for (let i = 0; i < NP; i++) {
+      if (pLife[i] > 0 && pKind[i] === 1) {
+        const sp = 1 + rnd() * 1.6;
+        pKind[i] = 2; pVX[i] = Math.cos(pAng[i]) * sp; pVY[i] = Math.sin(pAng[i]) * sp - 0.4;
+        const l = 26 + ((rnd() * 20) | 0); pLife[i] = l; pMax[i] = l;
+      }
+    }
+    for (let k = 0; k < 36; k++) {
+      const a = k / 36 * Math.PI * 2, sp = 1.1 + rnd() * 1.5;
+      spawn(2, gemX, gemY, Math.cos(a) * sp, Math.sin(a) * sp - 0.3, 24 + ((rnd() * 18) | 0), MAGICS[k % 3]);
+    }
+    shakeT = 10; shakeA = 2;
+  }
+  // projectile launch
+  if (lt === CAST_AT + 2) {
+    projOn = true; projT = 0;
+    projSX = gemX; projSY = gemY;
+    projDX = PROJ_TX - projSX; projDY = PROJ_TY - projSY;
+    projLen = Math.sqrt(projDX * projDX + projDY * projDY);
+  }
+  if (projOn) {
+    projT += 2.3 / projLen;
+    const w = Math.sin(projT * Math.PI * 2) * 3 * (1 - projT);
+    prX = projSX + projDX * projT + (-projDY / projLen) * w;
+    prY = projSY + projDY * projT + (projDX / projLen) * w;
+    for (let k = 0; k < 2; k++)
+      spawn(4, prX, prY, -projDX / projLen * 0.4 + (rnd() - 0.5) * 0.7, (rnd() - 0.5) * 0.7,
+            12 + ((rnd() * 12) | 0), MAGICS[(rnd() * 3) | 0]);
+    // collision with Kasra's silhouette box
+    if (prX >= KX - 5 && prX <= KX + 4 && prY >= 52 && prY <= FLOOR) {
+      projOn = false; hitT = lt;
+      for (let k = 0; k < 44; k++) {
+        const a = rnd() * Math.PI * 2, sp = 0.6 + rnd() * 2;
+        spawn(2, prX, prY, Math.cos(a) * sp, Math.sin(a) * sp - 0.7, 22 + ((rnd() * 24) | 0), MAGICS[k % 3]);
+      }
+      shakeT = 8; shakeA = 1;
+    }
+    if (projT > 1.3) projOn = false;
+  }
+  // spell wears off: faint motes rise from the fabric
+  if (lt >= REVERT_AT && lt < REVERT_AT + 48 && lt % 3 === 0)
+    spawn(3, KX - 4 + rnd() * 8, 71 + rnd() * 7, 0, -0.25, 30, CYAN);
+
+  // particles
+  for (let i = 0; i < NP; i++) {
+    if (pLife[i] <= 0) continue;
+    const k = pKind[i];
+    if (k === 1) {
+      pAng[i] += 0.17; pRad[i] -= 0.13;
+      pX[i] = gemX + Math.cos(pAng[i]) * pRad[i];
+      pY[i] = gemY + Math.sin(pAng[i]) * pRad[i];
+      if (pRad[i] < 1) pLife[i] = 0;
+    } else if (k === 2) {
+      pVY[i] += 0.045; pVX[i] *= 0.97; pVY[i] *= 0.97;
+      pX[i] += pVX[i]; pY[i] += pVY[i];
+      if (pY[i] > FLOOR) { pY[i] = FLOOR; pVY[i] *= -0.4; pVX[i] *= 0.6; }
+    } else if (k === 3) {
+      pY[i] += pVY[i];
+      pX[i] += Math.sin((pLife[i] + i) * 0.25) * 0.12;
+    } else {
+      pVX[i] *= 0.9; pVY[i] *= 0.9;
+      pX[i] += pVX[i]; pY[i] += pVY[i];
+    }
+    pLife[i]--;
+  }
+  if (shakeT > 0) shakeT--;
+}
+
+/* ---------------- Wizard (Sohrab) ---------------------------------- */
+const BEARD_W = new Uint8Array([6, 6, 6, 5, 5, 5, 4, 4, 3, 3, 2, 1]);
+const HAT_W = new Uint8Array([6, 5, 5, 4, 3, 3, 2]);
+const HAT_B = new Uint8Array([0, 0, 0, 1, 1, 2, 3]);
+
+function drawWizardBody() {
+  const cx = WX, top = 62 + bob;
+  // back arm
+  rect(LW, cx - 5, top + 1, 1, 7, ROBEO);
+  rect(LW, cx - 4, top + 1, 1, 7, ROBED);
+  rect(LW, cx - 5, top + 8, 2, 1, SKIND);
+  // boots
+  rect(LW, cx - 4, FLOOR, 3, 1, HAIR);
+  rect(LW, cx + 1, FLOOR, 4, 1, HAIR);
+  // robe: two-shade with outline, gold hem, belt and a fold
+  const span = 79 - top;
+  for (let y = top; y <= 79; y++) {
+    const t = (y - top) / span;
+    const half = 4 + Math.round(t * 3);
+    const so = Math.round(robeSway * t * t);
+    let l = cx - half + so, r = cx + half - 1 + so;
+    if (y === top) { l++; r--; }
+    const split = cx - 1 + Math.round(so * 0.5);
+    for (let x = l; x <= r; x++) {
+      let c;
+      if (x === l || x === r || y === 79) c = ROBEO;
+      else if (y === 78) c = GOLD;
+      else if (y === top + 6) c = (x === cx + 1) ? GOLD : ROBEO;
+      else if (x <= split) c = ROBED;
+      else if (x === cx + 2 + so && y > top + 8) c = ROBED;
+      else c = ROBEL;
+      px(LW, x, y, c);
+    }
+  }
+  // head
+  const hx = cx + tilt, hy = top - 7;
+  rect(LW, hx - 2, hy + 1, 1, 4, BEARDH);
+  rect(LW, hx - 1, hy + 1, 5, 5, SKIN);
+  rect(LW, hx - 1, hy + 1, 1, 5, SKIND);
+  px(LW, hx + 4, hy + 3, SKIN); px(LW, hx + 4, hy + 4, SKIND);
+  rect(LW, hx + 1, hy + 1, 3, 1, BEARDH);           // brow
+  px(LW, hx + 2, hy + 2, BEARD);                    // eye
+  px(LW, hx - 1, hy + 2, BEARD); px(LW, hx - 1, hy + 3, BEARD); // sideburn
+  // black beard: near-black mass + charcoal highlights
+  for (let k = 0; k < 12; k++) {
+    const w = BEARD_W[k];
+    const bs = k > 5 ? Math.round(beardSway * (k - 5) / 6) : 0;
+    const x0 = hx - 1 + ((6 - w) >> 1) + bs + (k > 2 ? 1 : 0);
+    const y = hy + 4 + k;
+    for (let i = 0; i < w; i++) {
+      let c = BEARD;
+      if (k === 0) c = (i === 0 || i === w - 1) ? BEARDH : BEARD;
+      else if (((k + i) % 4 === 1) && i < w - 1) c = BEARDH;
+      px(LW, x0 + i, y, c);
+    }
+  }
+  // hat: brim, gold band, bent cone, drooping tip
+  for (let x = hx - 4; x <= hx + 5; x++) px(LW, x, hy, (x === hx - 4 || x === hx + 5) ? ROBEO : ROBED);
+  for (let x = hx - 2; x <= hx + 3; x++) px(LW, x, hy - 1, (x === hx - 2 || x === hx + 3) ? ROBEO : GOLD);
+  let tipX = 0;
+  for (let k = 0; k < 7; k++) {
+    const w = HAT_W[k];
+    const bo = -HAT_B[k] + (k >= 4 ? hatSway : 0);
+    const x0 = hx + 1 - (w >> 1) + bo, y = hy - 2 - k;
+    for (let i = 0; i < w; i++) {
+      let c;
+      if (w > 2 && (i === 0 || i === w - 1)) c = ROBEO;
+      else if (w === 2) c = i === 0 ? ROBEO : ROBED;
+      else c = i === 1 ? ROBED : ROBEL;
+      px(LW, x0 + i, y, c);
+    }
+    tipX = x0;
+  }
+  px(LW, tipX - 1, hy - 8, ROBEO);
+  px(LW, tipX - 2, hy - 7, ROBEO);
+  px(LW, hx + 1, hy - 4, GOLD);                     // star
+  // front sleeve toward the staff hand
+  const sx = cx + 2, sy = top + 1;
+  line(LW, sx, sy + 2, handX - 1, handY + 2, ROBEO);
+  line(LW, sx, sy + 1, handX - 1, handY + 1, ROBED);
+  line(LW, sx, sy, handX - 1, handY, ROBEL);
+  px(LW, handX - 1, handY, GOLD); px(LW, handX - 1, handY + 1, GOLD);
+}
+
+function drawStaffAndGem() {
+  line(fb, staffBX, staffBY, gemX, gemY, WOOD);
+  // hand over staff
+  rect(fb, handX, handY, 2, 2, SKIN);
+  px(fb, handX, handY + 1, SKIND);
+  // gem
+  const af = (lt / 6) | 0;
+  let core = WHITE, arm = CYAN;
+  if (state === CHARGE) {
+    arm = (af & 1) ? MAG : CYAN;
+    core = (af % 3 === 0) ? YEL : WHITE;
+    if (stateT > 20 && (af & 1)) {
+      px(fb, gemX - 2, gemY - 2, arm); px(fb, gemX + 2, gemY - 2, arm);
+      px(fb, gemX - 2, gemY + 2, arm); px(fb, gemX + 2, gemY + 2, arm);
+    }
+  }
+  if (state === CAST && stateT < 14) {
+    const len = stateT < 6 ? 6 : 3;
+    for (let r = 2; r <= len; r++) {
+      const c = r < 4 ? WHITE : YEL;
+      px(fb, gemX - r, gemY, c); px(fb, gemX + r, gemY, c);
+      px(fb, gemX, gemY - r, c); px(fb, gemX, gemY + r, c);
+      if (r <= (len >> 1) + 1) {
+        px(fb, gemX - r + 1, gemY - r + 1, MAG); px(fb, gemX + r - 1, gemY - r + 1, MAG);
+        px(fb, gemX - r + 1, gemY + r - 1, MAG); px(fb, gemX + r - 1, gemY + r - 1, MAG);
+      }
+    }
+  }
+  px(fb, gemX - 1, gemY + 1, WOOD); px(fb, gemX + 1, gemY + 1, WOOD);   // prongs
+  px(fb, gemX - 1, gemY, arm); px(fb, gemX + 1, gemY, arm);
+  px(fb, gemX, gemY - 1, arm); px(fb, gemX, gemY + 1, arm);
+  px(fb, gemX, gemY, core);
+}
+
+/* ---------------- Young man (Kasra) -------------------------------- */
+const HOP = new Uint8Array([0, 1, 2, 2, 1, 0, 0, 0]);
+const SPARK = new Uint8Array([WHITE, YEL, MAG]);
+
+function drawKasra(mf, kb, hop, armUp, lookDown, rec, reverse) {
+  const X = KX + rec, oy = -hop, ub = kb + oy, fy = FLOOR + oy;
+  // white shoes (toes toward the wizard)
+  rect(LK, X - 4, fy, 3, 1, WHITE); rect(LK, X - 3, fy - 1, 2, 1, WHITE); px(LK, X - 2, fy - 1, WHITED);
+  rect(LK, X, fy, 3, 1, WHITE); rect(LK, X + 1, fy - 1, 2, 1, WHITE); px(LK, X + 2, fy - 1, WHITED);
+  // bare legs (covered progressively by the fabric)
+  for (let y = 70; y <= 78; y++) {
+    px(LK, X - 3, y + oy, SKIN); px(LK, X - 2, y + oy, SKIND);
+    px(LK, X + 1, y + oy, SKIN); px(LK, X + 2, y + oy, SKIND);
+  }
+  // ---- skirt -> pants morph, 8 frames ----
+  const m2 = clamp01((mf - 1) / 5);
+  const hemY = 76 + (mf >= 5 ? 2 : (mf >= 3 ? 1 : 0));
+  const splitTop = mf >= 3 ? Math.max(73, 80 - 2 * (mf - 2)) : 99;
+  const gapL = X - 1, gapR = mf >= 5 ? X : X - 1;
+  for (let y = 70; y <= hemY; y++) {
+    const flare = ((y - 70) * 2 / 5) | 0;
+    const sL = X - 3 - flare, sR = X + 2 + flare;
+    const l = Math.round(sL + (X - 3 - sL) * m2), r = Math.round(sR + (X + 2 - sR) * m2);
+    for (let x = l; x <= r; x++) {
+      if (y >= splitTop && x >= gapL && x <= gapR) continue;   // negative space between legs
+      let c;
+      if (mf < 4) {
+        c = (x === l || x === r || y === hemY) ? GRN : (((x - X + 12) % 3 === 0) ? GRN : GRNL); // pleats
+      } else if (y === hemY) {
+        c = GRN;                                              // cuffs
+      } else if (y < splitTop) {
+        c = (x === X - 1 || x >= X + 2 || x < X - 3) ? GRN : GRNL; // hips + centre seam
+      } else {
+        c = (x === X - 3 || x === X + 1) ? GRNL : GRN;        // two pant legs
+      }
+      if (mf >= 1 && mf <= 7) {
+        const h = hash(x, y, mf + (reverse ? 50 : 0));
+        if (h % 6 === 0) c = SPARK[(h >>> 4) % 3];
+      }
+      px(LK, x, y + oy, c);
+    }
+  }
+  // belt
+  rect(LK, X - 3, 69 + oy, 6, 1, HAIR); px(LK, X - 2, 69 + oy, GOLD);
+  // white shirt
+  for (let y = 59 + ub; y <= 68 + oy; y++) {
+    if (y === 59 + ub) { rect(LK, X - 4, y, 8, 1, WHITE); px(LK, X + 3, y, WHITED); continue; }
+    rect(LK, X - 3, y, 6, 1, WHITE);
+    px(LK, X + 2, y, WHITED);
+  }
+  px(LK, X - 2, 60 + ub, WHITED); px(LK, X + 1, 60 + ub, WHITED);   // collar
+  px(LK, X - 1, 62 + ub, WHITED); px(LK, X - 1, 65 + ub, WHITED);   // buttons
+  // back arm
+  rect(LK, X + 3, 60 + ub, 1, 4, WHITED);
+  rect(LK, X + 3, 64 + ub, 1, 4, SKIND);
+  // front arm
+  if (armUp) {
+    px(LK, X - 4, 60 + ub, WHITE); px(LK, X - 5, 59 + ub, WHITE); px(LK, X - 5, 58 + ub, WHITE);
+    px(LK, X - 6, 57 + ub, SKIN); px(LK, X - 6, 56 + ub, SKIN); px(LK, X - 6, 55 + ub, SKIN);
+  } else {
+    rect(LK, X - 4, 60 + ub, 1, 4, WHITE);
+    rect(LK, X - 4, 64 + ub, 1, 4, SKIN);
+  }
+  // neck + head
+  px(LK, X - 1, 58 + ub, SKIN); px(LK, X, 58 + ub, SKIND);
+  rect(LK, X - 2, 54 + ub, 4, 4, SKIN);
+  rect(LK, X - 2, 52 + ub, 4, 1, HAIR);
+  rect(LK, X - 3, 53 + ub, 6, 1, HAIR);
+  rect(LK, X + 1, 54 + ub, 2, 2, HAIR);
+  px(LK, X - 2, 54 + ub, HAIR);
+  px(LK, X - 3, 56 + ub, SKIN);                         // nose
+  px(LK, X + 1, 56 + ub, SKIND);                        // ear
+  if (lookDown) px(LK, X - 1, 56 + ub, BEARD); else px(LK, X - 1, 55 + ub, BEARD);
+  if (mf === 8) px(LK, X - 2, 57 + ub, SKIND);          // smile once in pants
+}
+
+/* ---------------- Layer compositing with 1px rim light ------------- */
+// Opaque pixels with a transparent neighbour on the lit side become rimC.
+// Transparent pixels touching the silhouette become glowC (outer glow).
+function composite(L, x0, y0, x1, y1, rimC, rimDir, topFromX, glowC) {
+  for (let y = y0; y <= y1; y++) {
+    for (let x = x0; x <= x1; x++) {
+      const i = y * W + x, c = L[i];
+      if (c !== T) {
+        let o = c;
+        if (rimC !== T && y < FLOOR) {
+          if (L[i + rimDir] === T) o = rimC;
+          else if (x >= topFromX && L[i - W] === T) o = rimC;
+        }
+        fb[i] = o;
+      } else if (glowC !== T) {
+        if (L[i - 1] !== T || L[i + 1] !== T || L[i - W] !== T || L[i + W] !== T) fb[i] = glowC;
+      }
+    }
+  }
+}
+
+const KGLOW = new Uint8Array([WHITE, YEL, MAG, PUR]);
+const KRIM = new Uint8Array([YEL, WHITE, CYAN, T]);
+
+/* ---------------- Render ------------------------------------------- */
+function render() {
+  fb.set(bg);
+
+  // twinkling stars (10 fps)
+  const tq = (tick / 6) | 0;
+  for (let i = 0; i < NSTARS; i++) {
+    const ph = (tq + starP[i]) & 63;
+    let c = (i & 3) === 0 ? WHITED : PURL;
+    if (ph < 2) c = WHITE; else if (ph < 4) c = WHITED; else if (ph > 60) c = SKY2;
+    px(fb, starX[i], starY[i], c);
+  }
+
+  // wizard body with gem rim light
+  LW.fill(T);
+  drawWizardBody();
+  let rim = PURL;
+  const af = (stateT / 6) | 0;
+  if (state === CHARGE) rim = stateT < 30 ? ((af & 1) ? CYAN : PURL) : ((af & 1) ? WHITE : CYAN);
+  else if (state === CAST) rim = stateT < 12 ? WHITE : CYAN;
+  else if (state === RECOVER) rim = stateT < 30 ? CYAN : PURL;
+  composite(LW, 1, 30, 50, FLOOR + 1, rim, 1, WX, T);
+  drawStaffAndGem();
+
+  // Kasra
+  let mf = 0, reverse = false;
+  if (hitT >= 0) {
+    if (lt < REVERT_AT) mf = Math.min(8, ((lt - hitT) / 6 | 0) + 1);
+    else { mf = Math.max(0, 8 - ((lt - REVERT_AT) / 6 | 0)); reverse = true; }
+  }
+  const kb = ((lt / 40) | 0) & 1;
+  let hop = 0, armUp = false, lookDown = false, rec = 0, glow = T, krim = T;
+  if (hitT >= 0) {
+    const ff = ((lt - hitT) / 6) | 0;
+    if (ff < 4) { glow = ff < 3 ? KGLOW[ff] : T; krim = KRIM[ff]; rec = ff < 2 ? 1 : 0; }
+    const hq = ((lt - hitT - 60) / 6) | 0;
+    if (lt - hitT >= 60 && hq < 16) { hop = HOP[hq & 7]; armUp = true; }
+    else if (lt - hitT >= 60) lookDown = true;
+  }
+  LK.fill(T);
+  drawKasra(mf, kb, hop, armUp, lookDown, rec, reverse);
+  composite(LK, 84, 44, 112, FLOOR + 1, krim, -1, 999, glow);
+
+  // projectile
+  if (projOn) {
+    const x = Math.round(prX), y = Math.round(prY);
+    const a = (tick >> 2) & 1 ? YEL : MAG;
+    px(fb, x - 1, y, a); px(fb, x + 1, y, a); px(fb, x, y - 1, a); px(fb, x, y + 1, a);
+    px(fb, x - 2, y, CYAN);
+    px(fb, x, y, WHITE);
+  }
+
+  // particles snapped to the grid
+  for (let i = 0; i < NP; i++) {
+    if (pLife[i] <= 0) continue;
+    px(fb, Math.round(pX[i]), Math.round(pY[i]), particleColor(i));
+  }
+
+  // palette lookup -> RGBA
+  for (let i = 0; i < W * H; i++) out32[i] = pal32[fb[i]];
+  octx.putImageData(img, 0, 0);
+
+  // integer-scaled blit with 1-2 logical pixel shake
+  let sx = 0, sy = 0;
+  if (shakeT > 0) {
+    const amp = shakeT > 5 ? shakeA : 1;
+    sx = (tick & 2) ? amp : -amp;
+    sy = (tick & 4) ? 1 : 0;
+  }
+  dctx.fillStyle = HEX[0];
+  dctx.fillRect(0, 0, disp.width, disp.height);
+  dctx.drawImage(off, offX + sx * scale, offY + sy * scale, W * scale, H * scale);
+}
+
+/* ---------------- Main loop: fixed 60 Hz step, rAF render ---------- */
+let last = performance.now(), acc = 0;
+function frame(now) {
+  let dt = now - last;
+  last = now;
+  if (dt > 250) dt = 250;
+  acc += dt;
+  while (acc >= STEP) { update(); acc -= STEP; }
+  render();
+  requestAnimationFrame(frame);
+}
+computePose();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
